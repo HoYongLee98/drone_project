@@ -5,8 +5,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='mini_drone',
-            executable='cf_telemetry',
-            name='cf_telemetry',
+            executable='cf_bridge',
+            name='cf_bridge',
             output='screen',
             parameters=[{
                 'uri': 'radio://0/80/2M/E7E7E7E7E7',

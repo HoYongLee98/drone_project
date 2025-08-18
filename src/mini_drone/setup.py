@@ -11,6 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/crazyflie_sensing.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/creative_chain.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,6 +25,7 @@ setup(
             'cf_telemetry = mini_drone.cf_telemetry_node:main',
             'ai_deck_camera = mini_drone.ai_deck_camera_node:main',
             'cf_bridge = mini_drone.cf_bridge_node:main',
+            'creative_behavior = mini_drone.creative_behavior_node:main',
         ],
     },
 )
