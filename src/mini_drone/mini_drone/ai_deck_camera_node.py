@@ -20,12 +20,9 @@ def set_tcp_keepalive(sock, enable=True, idle=10, intvl=3, cnt=5):
         pass
 
 def set_tcp_linger_rst(sock, enable=True):
-    # close() 시 즉시 RST 보내서 서버 쪽 TIME_WAIT/반쯤 열린 소켓 문제를 줄임
     try:
         import struct as _st
-        l_onoff = 1 if enable else 0
-        l_linger = 0
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _st.pack('ii', l_onoff, l_linger))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _st.pack('ii', 1 if enable else 0, 0))
     except Exception:
         pass
 
@@ -72,9 +69,9 @@ def main():
     node = rclpy.create_node('ai_deck_camera_node')
 
     # ---- Params ----
-    host = node.declare_parameter('host', '192.168.0.145').value  # STA만 쓴다면 이 값만 사용
+    host = node.declare_parameter('host', '192.168.0.145').value
     port = int(node.declare_parameter('port', 5000).value)
-    bind_ip = node.declare_parameter('bind_ip', '').value          # 필요 시 소스 IP 고정
+    bind_ip = node.declare_parameter('bind_ip', '').value
     frame_id = node.declare_parameter('frame_id', 'camera_optical_frame').value
     publish_raw = bool(node.declare_parameter('publish_raw', True).value)
     drop_corrupt = bool(node.declare_parameter('drop_corrupt', True).value)
@@ -87,7 +84,12 @@ def main():
     keepalive_idle    = int(node.declare_parameter('tcp_keepalive_idle_s', 10).value)
     keepalive_intvl   = int(node.declare_parameter('tcp_keepalive_intvl_s', 3).value)
     keepalive_cnt     = int(node.declare_parameter('tcp_keepalive_cnt', 5).value)
-    decode_async      = bool(node.declare_parameter('decode_async', True).value)  # True 권장
+    decode_async      = bool(node.declare_parameter('decode_async', True).value)
+
+    # --- FPS 리포트 주기(초) ---
+    fps_period_s      = float(node.declare_parameter('fps_report_period_s', 2.0).value)
+    fps_last_t = time.monotonic()
+    fps_count = 0
 
     # ---- QoS: Sensor Data ----
     qos = QoSProfile(depth=1)
@@ -133,6 +135,9 @@ def main():
         while rclpy.ok():
             try:
                 s = connect_once()
+                # 재연결 시 FPS 기준점 리셋(선택)
+                fps_last_t = time.monotonic()
+                fps_count = 0
             except Exception as e:
                 node.get_logger().warn(f"[NET] connect fail({host}): {e}. retry...")
                 time.sleep(reconnect_backoff)
@@ -158,7 +163,6 @@ def main():
                         continue
                     if size <= 0 or size > max(max_jpeg, w*h*max(1,depth)*2):
                         node.get_logger().warn(f"[NET] weird size={size}, skip")
-                        # payload는 다음 루프에서 재동기화
                         continue
 
                     # ---- Receive payload in chunks ----
@@ -175,7 +179,7 @@ def main():
                     now = node.get_clock().now().to_msg()
 
                     if fmt == 0:
-                        # RAW Bayer -> BGR (동기 디코드; decode_async는 JPEG에만 적용)
+                        # RAW Bayer -> BGR
                         try:
                             arr = np.frombuffer(img, np.uint8).reshape((h, w))
                             with contextlib.redirect_stderr(io.StringIO()):
@@ -187,13 +191,13 @@ def main():
                         except Exception as e:
                             node.get_logger().warn(f"[RAW] decode 실패: {e}")
                     else:
-                        # JPEG: 즉시 압축본 publish
+                        # JPEG: 압축본 publish
                         comp = CompressedImage()
                         comp.format = 'jpeg'; comp.data = bytes(img)
                         comp.header.stamp = now; comp.header.frame_id = frame_id
                         pub_comp.publish(comp)
 
-                        # 원하면 비동기 디코드로 raw도 publish
+                        # 필요 시 RAW 비동기 디코드
                         if publish_raw and decode_async:
                             decoder.push(now, bytes(img), w, h)
                         elif publish_raw and not decode_async:
@@ -209,7 +213,16 @@ def main():
                             except Exception as e:
                                 node.get_logger().warn(f"[JPEG] decode 실패: {e}")
 
-                # rclpy.ok()가 False면 루프 종료
+                    # --- FPS 계산/로그 ---
+                    fps_count += 1
+                    now_mono = time.monotonic()
+                    dt = now_mono - fps_last_t
+                    if dt >= fps_period_s:
+                        fps = fps_count / dt if dt > 0 else 0.0
+                        node.get_logger().info(f"[FPS] {fps:.2f} Hz (window {dt:.2f}s, frames {fps_count})")
+                        fps_last_t = now_mono
+                        fps_count = 0
+
             except (socket.timeout,) as e:
                 node.get_logger().warn(f"[NET] recv timeout: {e} → 재연결")
             except (ConnectionError, OSError) as e:
