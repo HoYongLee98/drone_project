@@ -66,7 +66,7 @@ class DecodeWorker:
 
 def main():
     rclpy.init()
-    node = rclpy.create_node('ai_deck_camera_node')
+    node = rclpy.create_node('ai_deck_camera')
 
     # ---- Params ----
     host = node.declare_parameter('host', '192.168.0.145').value

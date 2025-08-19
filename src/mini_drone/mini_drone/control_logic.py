@@ -11,6 +11,7 @@ from std_srvs.srv import Trigger
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import rclpy
 
+from rcl_interfaces.msg import SetParametersResult
 
 class ControlManager:
     """
@@ -32,6 +33,9 @@ class ControlManager:
         self.node.declare_parameter('dry_run', True)
         # self.dry_run = bool(self.node.get_parameter('dry_run').get_parameter_value().bool_value or True)
         self.dry_run = bool(self.node.get_parameter('dry_run').get_parameter_value().bool_value)
+
+        self.node.add_on_set_parameters_callback(self._on_set_params)
+        self.node.get_logger().info(f'dry_run initial={self.dry_run}')
 
         self.cf = None
         self._lock = threading.Lock()
@@ -108,6 +112,13 @@ class ControlManager:
             self._pat_th.join(timeout=1.0)
         self._pat_th = None
         self._pat_stop.clear()
+
+    def _on_set_params(self, params):
+        for p in params:
+            if p.name == 'dry_run':
+                self.dry_run = bool(p.value)
+                self.node.get_logger().warn(f'[PARAM] dry_run -> {self.dry_run}')
+        return SetParametersResult(successful=True)
 
     # ========== E-STOP helpers ==========
     def _publish_estop_state(self):

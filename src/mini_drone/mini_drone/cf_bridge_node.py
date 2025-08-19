@@ -46,7 +46,7 @@ class CfBridgeNode(Node):
     """
 
     def __init__(self):
-        super().__init__('cf_bridge_node')
+        super().__init__('cf_bridge')
 
         # ---- Parameters ----
         self.declare_parameter('uri', 'radio://0/80/2M/E7E7E7E7E7')
