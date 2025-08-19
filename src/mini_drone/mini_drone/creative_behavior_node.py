@@ -9,7 +9,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from std_msgs.msg import Float32, Float32MultiArray
+from std_msgs.msg import Float32, Float32MultiArray, Bool
 from geometry_msgs.msg import TwistStamped, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, Range
@@ -37,8 +37,10 @@ class Phase(Enum):
     DETECT = auto()
     GREET_DOWN = auto()
     GREET_UP = auto()
-    AVOID = auto()
+    AVOID = auto()       # 회피1(대각)
     FORWARD2 = auto()
+    AVOID2 = auto()      # 회피2(반대방향 대각)
+    FORWARD3 = auto()
     LAND = auto()
     DONE = auto()
     ABORT = auto()
@@ -53,54 +55,65 @@ class CreativeBehaviorNode(Node):
     def __init__(self):
         super().__init__("creative_behavior")
 
+        # ---------- Emergency Stop ----------
+        self._estop = False
+        qos_estop = QoSProfile(depth=10)
+        qos_estop.reliability = ReliabilityPolicy.BEST_EFFORT
+        qos_estop.history = HistoryPolicy.KEEP_LAST
+        self.create_subscription(Bool, '/cf/estop', self._on_estop, qos_estop)
+
         # ---------- Parameters ----------
         # 토픽
-        self.declare_parameter("image_topic", "/camera/image_raw")
+        self.declare_parameter("image_topic", "/camera/image")
         self.declare_parameter("odom_topic", "/cf/odom")
         self.declare_parameter("front_range_topic", "/cf/range/front")
 
         # 시나리오 파라미터
-        self.declare_parameter("takeoff_height_m", 0.5)
+        self.declare_parameter("takeoff_height_m", 0.4)
         self.declare_parameter("takeoff_timeout_s", 8.0)
         self.declare_parameter("forward_speed_mps", 0.3)
         self.declare_parameter("forward1_time_s", 3.0)
         self.declare_parameter("forward2_time_s", 3.0)
-        self.declare_parameter("greet_delta_z_m", 0.15)     # 인사: 아래로 내릴 폭
+        self.declare_parameter("forward3_time_s", 3.0)           # 추가: 전진3 시간
+        self.declare_parameter("greet_delta_z_m", 0.15)           # 인사: 아래로 내릴 폭
         self.declare_parameter("greet_pause_s", 0.8)
         self.declare_parameter("avoid_lateral_speed_mps", 0.25)
+        self.declare_parameter("avoid_forward_speed_mps", 0.15)   # 추가: 옆걸음 중 전진 속도(대각 이동)
         self.declare_parameter("avoid_time_s", 2.0)
-        self.declare_parameter("hover_cmd_rate_hz", 30.0)   # hover setpoint 전송 주기
-        self.declare_parameter("safety_front_min_m", 0.5)   # 전방 최소 거리
+        self.declare_parameter("hover_cmd_rate_hz", 30.0)         # hover setpoint 전송 주기
+        self.declare_parameter("safety_front_min_m", 0.2)         # 전방 최소 거리(초근접 시 착륙)
 
         # 탐지 파라미터
         self.declare_parameter("use_yolo", True)
         self.declare_parameter("yolo_model_path", "yolov8n.pt")
-        self.declare_parameter("yolo_conf_th", 0.4)
+        self.declare_parameter("yolo_conf_th", 0.6)
         self.declare_parameter("hog_stride", 8)  # HOG 폴백용
         self.declare_parameter("detect_center_weight", 0.3)  # 중앙 가중(선택)
         self.declare_parameter("detect_timeout_s", 12.0)
 
-        # 내부 상태
+        # ---------- Load params ----------
         p = lambda n: self.get_parameter(n).get_parameter_value()
         self.image_topic = p("image_topic").string_value
         self.odom_topic = p("odom_topic").string_value
         self.front_range_topic = p("front_range_topic").string_value
 
-        self.alt_target = float(p("takeoff_height_m").double_value or 0.5)
+        self.alt_target = float(p("takeoff_height_m").double_value or 0.4)
         self.takeoff_timeout_s = float(p("takeoff_timeout_s").double_value or 8.0)
         self.v_forward = float(p("forward_speed_mps").double_value or 0.3)
         self.forward1_time = float(p("forward1_time_s").double_value or 3.0)
         self.forward2_time = float(p("forward2_time_s").double_value or 3.0)
+        self.forward3_time = float(p("forward3_time_s").double_value or 3.0)
         self.greet_dz = float(p("greet_delta_z_m").double_value or 0.15)
         self.greet_pause = float(p("greet_pause_s").double_value or 0.8)
-        self.v_avoid = float(p("avoid_lateral_speed_mps").double_value or 0.25)
+        self.v_avoid_lat = float(p("avoid_lateral_speed_mps").double_value or 0.25)
+        self.v_avoid_fwd = float(p("avoid_forward_speed_mps").double_value or 0.15)
         self.avoid_time = float(p("avoid_time_s").double_value or 2.0)
         self.cmd_rate = float(p("hover_cmd_rate_hz").double_value or 30.0)
-        self.safety_front_min = float(p("safety_front_min_m").double_value or 0.5)
+        self.safety_front_min = float(p("safety_front_min_m").double_value or 0.2)
 
         self.use_yolo = bool(p("use_yolo").bool_value or True)
         self.yolo_model_path = p("yolo_model_path").string_value or "yolov8n.pt"
-        self.yolo_conf_th = float(p("yolo_conf_th").double_value or 0.4)
+        self.yolo_conf_th = float(p("yolo_conf_th").double_value or 0.6)
         self.hog_stride = int(p("hog_stride").integer_value or 8)
         self.detect_center_weight = float(p("detect_center_weight").double_value or 0.3)
         self.detect_timeout_s = float(p("detect_timeout_s").double_value or 12.0)
@@ -156,15 +169,24 @@ class CreativeBehaviorNode(Node):
         self.phase_t0 = self._now()
         self.odom: Optional[Odometry] = None
         self.front_m: Optional[float] = None
-        self.greet_phase_done = False
-        self.avoid_dir = 0  # -1: 왼쪽으로 피하기, +1: 오른쪽
         self.person_last_seen_t = None
         self.alt_current = 0.0  # 추정 고도(odom z)
+
+        # 회피 방향: 좌(+1)/우(-1)
+        # 화면 중심 대비 x_offset<0(왼쪽에 사람) → 오른쪽으로 피하기 위해 -1
+        self.avoid_dir = -1
 
         # 제어 타이머(hover 전송 포함)
         self.create_timer(1.0 / max(1.0, self.cmd_rate), self._tick)
 
         self.get_logger().info("Creative behavior node 시작")
+
+    # ---------- Emergency Stop ----------
+    def _on_estop(self, msg: Bool):
+        if msg.data and not self._estop:
+            self._estop = True
+            self.get_logger().warn('E-STOP latched → 동작 중지')
+            self.phase = Phase.ABORT  # 상태머신도 멈춤
 
     # ------------- Utils -------------
     def _now(self) -> float:
@@ -185,9 +207,12 @@ class CreativeBehaviorNode(Node):
             self.get_logger().warn(f"이미지 변환 실패: {e}")
 
     def _publish_hover(self, vx: float, vy: float, z: float, yaw_rate_rad_s: float = 0.0):
+        if self._estop:
+            return
+
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        # body frame: x forward, y left
+        # body frame: x forward, y left(+) / right(-)
         msg.twist.linear.x = float(vx)
         msg.twist.linear.y = float(vy)
         msg.twist.linear.z = float(z)     # hover API에서 z는 절대 고도
@@ -195,12 +220,21 @@ class CreativeBehaviorNode(Node):
         self.pub_hover.publish(msg)
 
     def _publish_takeoff(self, z: float):
+        if self._estop:
+            return
+
         self.pub_takeoff.publish(Float32(data=float(z)))
 
     def _publish_land(self, z: float = 0.0):
+        if self._estop:
+            return
+
         self.pub_land.publish(Float32(data=float(z)))
 
     def _publish_goto_z(self, z: float):
+        if self._estop or self.odom is None:
+            return
+
         """현재 x,y 유지, z만 변경하는 HL goto"""
         if self.odom is None:
             return
@@ -210,8 +244,7 @@ class CreativeBehaviorNode(Node):
         ps.pose.position.x = float(self.odom.pose.pose.position.x)
         ps.pose.position.y = float(self.odom.pose.pose.position.y)
         ps.pose.position.z = float(z)
-        # yaw 미지정 → 0으로 두면 현재 유지
-        ps.pose.orientation.w = 1.0
+        ps.pose.orientation.w = 1.0  # yaw 유지
         self.pub_goto.publish(ps)
 
     # ------------- Detection -------------
@@ -278,9 +311,12 @@ class CreativeBehaviorNode(Node):
 
     # ------------- Main tick (state machine + hover cmds) -------------
     def _tick(self):
+        if self._estop:
+            return
+            
         now = self._now()
 
-        # 공통 안전: 전방 장애물
+        # 공통 안전: 전방 장애물(초근접 시 착륙)
         if self.front_m is not None and self.front_m < self.safety_front_min and self.phase not in (Phase.LAND, Phase.DONE, Phase.ABORT):
             self.get_logger().warn(f"전방 장애물 감지({self.front_m:.2f} m). 비상 착륙 시도.")
             self._publish_hover(0.0, 0.0, self.alt_current, 0.0)
@@ -315,9 +351,10 @@ class CreativeBehaviorNode(Node):
         elif self.phase == Phase.DETECT:
             detected, xoff = self._detect_person()
             if detected:
-                self.person_last_seen_t = now
-                # 중앙 기준 좌/우 판단(양수: 오른쪽)
-                self.avoid_dir = -1 if (xoff is not None and xoff > 0.0) else 1
+                # 회피 방향 결정: 사람의 좌/우 반대로 이동
+                # xoff<0(왼쪽) → 오른쪽으로 피하려면 avoid_dir=-1, xoff>0(오른쪽) → 왼쪽으로 피하려면 +1
+                if xoff is not None:
+                    self.avoid_dir = -1 if xoff < 0.0 else 1
                 self.get_logger().info(f"사람 인식! x_offset={xoff if xoff is not None else 'NA'} → 인사")
                 # HL로 z 내리기
                 self._publish_goto_z(max(0.1, self.alt_target - self.greet_dz))
@@ -341,23 +378,41 @@ class CreativeBehaviorNode(Node):
 
         elif self.phase == Phase.GREET_UP:
             if (now - self.phase_t0) > self.greet_pause:
-                self.get_logger().info("인사 완료 → 회피 기동")
+                self.get_logger().info("인사 완료 → 회피1(대각)")
                 self.phase = Phase.AVOID
                 self.phase_t0 = now
 
         elif self.phase == Phase.AVOID:
-            # 옆으로 회피
-            vy = self.v_avoid * float(self.avoid_dir)  # 좌(+), 우(-)
-            self._publish_hover(0.0, vy, self.alt_target, 0.0)
+            # 회피1: 옆걸음 + 전진(대각 이동)
+            vx = self.v_avoid_fwd
+            vy = self.v_avoid_lat * float(self.avoid_dir)  # 좌(+), 우(-)
+            self._publish_hover(vx, vy, self.alt_target, 0.0)
             if (now - self.phase_t0) > self.avoid_time:
-                self.get_logger().info("회피 완료 → 전진2")
+                self.get_logger().info("회피1 완료 → 전진2")
                 self.phase = Phase.FORWARD2
                 self.phase_t0 = now
 
         elif self.phase == Phase.FORWARD2:
             self._publish_hover(self.v_forward, 0.0, self.alt_target, 0.0)
             if (now - self.phase_t0) > self.forward2_time:
-                self.get_logger().info("전진2 완료 → 착륙")
+                self.get_logger().info("전진2 완료 → 회피2(반대방향 대각)")
+                self.phase = Phase.AVOID2
+                self.phase_t0 = now
+
+        elif self.phase == Phase.AVOID2:
+            # 회피2: 반대방향 옆걸음 + 전진(대각 이동, 복귀 느낌)
+            vx = self.v_avoid_fwd
+            vy = - self.v_avoid_lat * float(self.avoid_dir)
+            self._publish_hover(vx, vy, self.alt_target, 0.0)
+            if (now - self.phase_t0) > self.avoid_time:
+                self.get_logger().info("회피2 완료 → 전진3")
+                self.phase = Phase.FORWARD3
+                self.phase_t0 = now
+
+        elif self.phase == Phase.FORWARD3:
+            self._publish_hover(self.v_forward, 0.0, self.alt_target, 0.0)
+            if (now - self.phase_t0) > self.forward3_time:
+                self.get_logger().info("전진3 완료 → 착륙")
                 self._publish_land(0.0)
                 self.phase = Phase.LAND
                 self.phase_t0 = now

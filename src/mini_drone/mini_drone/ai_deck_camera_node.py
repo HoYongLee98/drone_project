@@ -1,24 +1,93 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import socket, struct, io, contextlib, numpy as np, cv2
+import socket, struct, io, contextlib, numpy as np, cv2, threading, collections, time
 import rclpy
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 
+def set_tcp_keepalive(sock, enable=True, idle=10, intvl=3, cnt=5):
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1 if enable else 0)
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
+        if hasattr(socket, 'TCP_KEEPINTVL'):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, intvl)
+        if hasattr(socket, 'TCP_KEEPCNT'):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, cnt)
+    except Exception:
+        pass
+
+def set_tcp_linger_rst(sock, enable=True):
+    # close() 시 즉시 RST 보내서 서버 쪽 TIME_WAIT/반쯤 열린 소켓 문제를 줄임
+    try:
+        import struct as _st
+        l_onoff = 1 if enable else 0
+        l_linger = 0
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _st.pack('ii', l_onoff, l_linger))
+    except Exception:
+        pass
+
+class DecodeWorker:
+    """JPEG 디코딩을 메인 소켓 스레드와 분리(버퍼 길이=1, 밀리면 이전 프레임 drop)."""
+    def __init__(self, node, pub_raw, frame_id, enable=True):
+        self.node = node
+        self.pub_raw = pub_raw
+        self.frame_id = frame_id
+        self.enable = enable
+        self.bridge = CvBridge()
+        self.buf = collections.deque(maxlen=1)
+        self.event = threading.Event()
+        self.th = threading.Thread(target=self._run, daemon=True)
+        if enable and pub_raw is not None:
+            self.th.start()
+
+    def push(self, stamp, jpeg_bytes, w, h):
+        if not self.enable or self.pub_raw is None:
+            return
+        self.buf.append((stamp, jpeg_bytes, w, h))
+        self.event.set()
+
+    def _run(self):
+        while True:
+            self.event.wait(1.0)
+            while self.buf:
+                stamp, jpeg, w, h = self.buf.popleft()
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
+                    msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+                    msg.header.stamp = stamp
+                    msg.header.frame_id = self.frame_id
+                    self.pub_raw.publish(msg)
+                except Exception as e:
+                    self.node.get_logger().warn(f'[DECODE] 실패: {e}')
+            self.event.clear()
+
 def main():
     rclpy.init()
     node = rclpy.create_node('ai_deck_camera_node')
 
-    # ---- Params (데모와 동일 기본값) ----
-    host = node.declare_parameter('host', '192.168.0.145').value
+    # ---- Params ----
+    host = node.declare_parameter('host', '192.168.0.145').value  # STA만 쓴다면 이 값만 사용
     port = int(node.declare_parameter('port', 5000).value)
-    bind_ip = node.declare_parameter('bind_ip', '').value  # 예: "192.168.0.41"
+    bind_ip = node.declare_parameter('bind_ip', '').value          # 필요 시 소스 IP 고정
     frame_id = node.declare_parameter('frame_id', 'camera_optical_frame').value
     publish_raw = bool(node.declare_parameter('publish_raw', True).value)
     drop_corrupt = bool(node.declare_parameter('drop_corrupt', True).value)
     max_jpeg = int(node.declare_parameter('max_jpeg_size', 2_000_000).value)
+
+    # 네트워크 내구성 옵션
+    connect_timeout_s = float(node.declare_parameter('connect_timeout_s', 3.0).value)
+    read_timeout_s    = float(node.declare_parameter('read_timeout_s', 5.0).value)
+    reconnect_backoff = float(node.declare_parameter('reconnect_backoff_s', 1.5).value)
+    keepalive_idle    = int(node.declare_parameter('tcp_keepalive_idle_s', 10).value)
+    keepalive_intvl   = int(node.declare_parameter('tcp_keepalive_intvl_s', 3).value)
+    keepalive_cnt     = int(node.declare_parameter('tcp_keepalive_cnt', 5).value)
+    decode_async      = bool(node.declare_parameter('decode_async', True).value)  # True 권장
 
     # ---- QoS: Sensor Data ----
     qos = QoSProfile(depth=1)
@@ -28,95 +97,134 @@ def main():
 
     pub_comp = node.create_publisher(CompressedImage, '/camera/image/compressed', qos)
     pub_raw  = node.create_publisher(Image, '/camera/image', qos) if publish_raw else None
-    bridge = CvBridge()
 
-    # ---- Socket (데모와 동일한 블로킹 수신) ----
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    if bind_ip:
-        s.bind((bind_ip, 0))
-        node.get_logger().info(f"[NET] bind {bind_ip}")
-    node.get_logger().info(f"[NET] connect {host}:{port} ...")
-    s.connect((host, port))
-    node.get_logger().info("[NET] connected")
+    decoder = DecodeWorker(node, pub_raw, frame_id, enable=decode_async)
 
-    def rx_bytes(n: int) -> bytes:
+    def connect_once():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        set_tcp_keepalive(s, True, keepalive_idle, keepalive_intvl, keepalive_cnt)
+        set_tcp_linger_rst(s, True)
+        if bind_ip:
+            try:
+                s.bind((bind_ip, 0))
+                node.get_logger().info(f"[NET] bind {bind_ip}")
+            except Exception as e:
+                node.get_logger().warn(f"[NET] bind 실패({bind_ip}): {e}")
+
+        s.settimeout(connect_timeout_s)
+        node.get_logger().info(f"[NET] connect {host}:{port} ...")
+        s.connect((host, port))
+        s.settimeout(read_timeout_s)
+        node.get_logger().info("[NET] connected")
+        return s
+
+    def rx_bytes(s, n: int) -> bytes:
         buf = bytearray()
         while len(buf) < n:
             chunk = s.recv(n - len(buf))
             if not chunk:
-                raise ConnectionError("socket closed")
+                raise ConnectionError("socket closed by peer")
             buf.extend(chunk)
         return bytes(buf)
 
+    # ---- main loop with auto-reconnect ----
     try:
         while rclpy.ok():
-            # ---- Packet header ----
-            pkt = rx_bytes(4)                           # <HBB
-            length, routing, function = struct.unpack('<HBB', pkt)
-            # ---- Image header ----
-            hdr = rx_bytes(length - 2)                  # <BHHBBI
-            magic, w, h, depth, fmt, size = struct.unpack('<BHHBBI', hdr)
-            if magic != 0xBC:
-                node.get_logger().warn(f"Bad magic 0x{magic:02X}, resync")
-                continue
-            if size <= 0 or size > max(max_jpeg, w*h*max(1,depth)*2):
-                node.get_logger().warn(f"Weird size={size}, skip")
-                # 남은 스트림은 다음 루프에서 재동기화
+            try:
+                s = connect_once()
+            except Exception as e:
+                node.get_logger().warn(f"[NET] connect fail({host}): {e}. retry...")
+                time.sleep(reconnect_backoff)
                 continue
 
-            # ---- Receive payload in chunks ----
-            img = bytearray()
-            while len(img) < size:
-                chdr = rx_bytes(4)                       # <HBB
-                clen, dst, src = struct.unpack('<HBB', chdr)
-                chunk = rx_bytes(clen - 2)
-                need = size - len(img)
-                img.extend(chunk[:need])
+            try:
+                while rclpy.ok():
+                    # ---- CPX Packet header ----
+                    pkt = rx_bytes(s, 4)                    # <HBB
+                    length, routing, function = struct.unpack('<HBB', pkt)
+                    if length < 2 or length > 4096:
+                        node.get_logger().warn(f"[NET] bad CPX length={length}, resync")
+                        continue
 
-            now = node.get_clock().now().to_msg()
+                    # ---- Image header ----
+                    hdr = rx_bytes(s, length - 2)           # <BHHBBI
+                    if len(hdr) != (length - 2):
+                        raise ConnectionError("short read on header")
 
-            if fmt == 0:
-                # RAW Bayer -> BGR
+                    magic, w, h, depth, fmt, size = struct.unpack('<BHHBBI', hdr)
+                    if magic != 0xBC:
+                        node.get_logger().warn(f"[NET] bad magic 0x{magic:02X}, resync")
+                        continue
+                    if size <= 0 or size > max(max_jpeg, w*h*max(1,depth)*2):
+                        node.get_logger().warn(f"[NET] weird size={size}, skip")
+                        # payload는 다음 루프에서 재동기화
+                        continue
+
+                    # ---- Receive payload in chunks ----
+                    img = bytearray()
+                    while len(img) < size:
+                        chdr = rx_bytes(s, 4)               # <HBB
+                        clen, dst, src = struct.unpack('<HBB', chdr)
+                        if clen < 2 or clen > 2048:
+                            raise ConnectionError("bad chunk len")
+                        chunk = rx_bytes(s, clen - 2)
+                        need = size - len(img)
+                        img.extend(chunk[:need])
+
+                    now = node.get_clock().now().to_msg()
+
+                    if fmt == 0:
+                        # RAW Bayer -> BGR (동기 디코드; decode_async는 JPEG에만 적용)
+                        try:
+                            arr = np.frombuffer(img, np.uint8).reshape((h, w))
+                            with contextlib.redirect_stderr(io.StringIO()):
+                                bgr = cv2.cvtColor(arr, cv2.COLOR_BayerBG2BGR)
+                            if pub_raw:
+                                msg = CvBridge().cv2_to_imgmsg(bgr, encoding='bgr8')
+                                msg.header.stamp = now; msg.header.frame_id = frame_id
+                                pub_raw.publish(msg)
+                        except Exception as e:
+                            node.get_logger().warn(f"[RAW] decode 실패: {e}")
+                    else:
+                        # JPEG: 즉시 압축본 publish
+                        comp = CompressedImage()
+                        comp.format = 'jpeg'; comp.data = bytes(img)
+                        comp.header.stamp = now; comp.header.frame_id = frame_id
+                        pub_comp.publish(comp)
+
+                        # 원하면 비동기 디코드로 raw도 publish
+                        if publish_raw and decode_async:
+                            decoder.push(now, bytes(img), w, h)
+                        elif publish_raw and not decode_async:
+                            try:
+                                with contextlib.redirect_stderr(io.StringIO()):
+                                    frame = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+                                if frame is not None:
+                                    msg = CvBridge().cv2_to_imgmsg(frame, encoding='bgr8')
+                                    msg.header.stamp = now; msg.header.frame_id = frame_id
+                                    pub_raw.publish(msg)
+                                elif not drop_corrupt:
+                                    node.get_logger().warn("[JPEG] imdecode 실패, drop")
+                            except Exception as e:
+                                node.get_logger().warn(f"[JPEG] decode 실패: {e}")
+
+                # rclpy.ok()가 False면 루프 종료
+            except (socket.timeout,) as e:
+                node.get_logger().warn(f"[NET] recv timeout: {e} → 재연결")
+            except (ConnectionError, OSError) as e:
+                node.get_logger().warn(f"[NET] 연결 끊김: {e} → 재연결")
+            finally:
                 try:
-                    arr = np.frombuffer(img, np.uint8).reshape((h, w))
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        bgr = cv2.cvtColor(arr, cv2.COLOR_BayerBG2BGR)
-                    if pub_raw:
-                        msg = bridge.cv2_to_imgmsg(bgr, encoding='bgr8')
-                        msg.header.stamp = now; msg.header.frame_id = frame_id
-                        pub_raw.publish(msg)
-                    # RAW는 압축본이 없으므로 원하면 아래처럼 만들 수 있음:
-                    # ok, enc = cv2.imencode('.jpg', bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                    # if ok: ... pub_comp.publish(...)
+                    s.close()
                 except Exception:
-                    node.get_logger().warn("RAW decode failed, drop")
-            else:
-                # JPEG: 압축 그대로 퍼블리시 (+ 옵션으로 디코딩)
-                comp = CompressedImage()
-                comp.format = 'jpeg'; comp.data = bytes(img)
-                comp.header.stamp = now; comp.header.frame_id = frame_id
-                pub_comp.publish(comp)
-
-                if pub_raw:
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        frame = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        msg = bridge.cv2_to_imgmsg(frame, encoding='bgr8')
-                        msg.header.stamp = now; msg.header.frame_id = frame_id
-                        pub_raw.publish(msg)
-                    elif not drop_corrupt:
-                        node.get_logger().warn("imdecode failed, drop")
+                    pass
+                time.sleep(reconnect_backoff)
 
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
